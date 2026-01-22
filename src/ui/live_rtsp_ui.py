@@ -27,9 +27,10 @@ log = logging.getLogger("LIVE")
 BG_MAIN = "#0b0f1a"
 ACCENT = "#00e5ff"
 
-EMB_BUFFER_SIZE = 5
-RECOGNITION_COOLDOWN = 6.0
-SIM_THRESHOLD = 0.65
+EMB_BUFFER_SIZE = 3          # was 5
+RECOGNITION_COOLDOWN = 1.2  # was 6.0 seconds
+SIM_THRESHOLD = 0.60        # was 0.65
+
 
 
 # ================== BYTETRACK CONFIG ==================
@@ -223,21 +224,39 @@ class LiveRTSPUI:
 
     # ================== ARCFACE ==================
     def run_arcface(self, cache, frame, x1, y1, x2, y2, landmarks):
+        """
+        Fast entry-recognition ArcFace pipeline
+        - Collects embeddings per track
+        - Early-lock at 2 embeddings (high confidence)
+        - Mean embedding at EMB_BUFFER_SIZE
+        - Locks once, no retries after lock
+        """
+
         cache["last_attempt"] = time.time()
 
+        # ---- crop face ----
         pad = 20
-        fx1, fy1 = max(0,x1-pad), max(0,y1-pad)
-        fx2, fy2 = min(frame.shape[1],x2+pad), min(frame.shape[0],y2+pad)
+        fx1, fy1 = max(0, x1 - pad), max(0, y1 - pad)
+        fx2, fy2 = min(frame.shape[1], x2 + pad), min(frame.shape[0], y2 + pad)
 
         roi = frame[fy1:fy2, fx1:fx2]
-        lm = landmarks.copy()
-        lm[:,0] -= fx1
-        lm[:,1] -= fy1
+        if roi.size == 0:
+            return
 
-        aligned = align_face(roi, lm)
-        aligned = cv2.resize(aligned, (112,112))
+        lm = landmarks.copy()
+        lm[:, 0] -= fx1
+        lm[:, 1] -= fy1
+
+        # ---- align ----
+        try:
+            aligned = align_face(roi, lm)
+        except Exception:
+            return
+
+        aligned = cv2.resize(aligned, (112, 112))
         aligned = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
 
+        # ---- ArcFace embedding ----
         emb = self.arcface.get_embedding(aligned)
         norm = np.linalg.norm(emb)
         if norm == 0:
@@ -246,8 +265,32 @@ class LiveRTSPUI:
         emb = emb / norm
         cache["embeddings"].append(emb)
 
-        if len(cache["embeddings"]) < EMB_BUFFER_SIZE:
-            log.debug(f"🧪 Collecting embeddings {len(cache['embeddings'])}/{EMB_BUFFER_SIZE}")
+        count = len(cache["embeddings"])
+        log.debug(f"🧪 Collecting embeddings {count}/{EMB_BUFFER_SIZE}")
+
+        # ================= EARLY FAST-PATH (2 embeddings) =================
+        if count >= 2:
+            mean_fast = np.mean(cache["embeddings"], axis=0)
+            mean_fast /= np.linalg.norm(mean_fast)
+
+            best_id, best_sim = None, 0.0
+            for emp, lst in self.known_embeddings.items():
+                for ref in lst:
+                    sim = float(np.dot(mean_fast, ref))
+                    if sim > best_sim:
+                        best_sim, best_id = sim, emp
+
+            if best_sim >= 0.72:  # higher threshold for early lock
+                cache.update({
+                    "emp_id": best_id,
+                    "sim": best_sim,
+                    "locked": True
+                })
+                log.info(f"⚡ FAST LOCK → {best_id} ({best_sim:.2f})")
+                return
+
+        # ================= NORMAL PATH (3 embeddings) =================
+        if count < EMB_BUFFER_SIZE:
             return
 
         mean_emb = np.mean(cache["embeddings"], axis=0)
@@ -266,7 +309,7 @@ class LiveRTSPUI:
                 "sim": best_sim,
                 "locked": True
             })
-            log.info(f"🔒 Identity LOCKED → {best_id}")
+            log.info(f"🔒 Identity LOCKED → {best_id} ({best_sim:.2f})")
         else:
             cache["embeddings"].clear()
             log.warning("🚫 Recognition failed (buffer reset)")
