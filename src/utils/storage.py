@@ -18,3 +18,12 @@ def get_employee_face_dir(emp_id: str, emp_name: str) -> Path:
 
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+def get_employees_root() -> Path:
+    return (
+        Path.home()
+        / "Documents"
+        / "YOAR_AttendaceSystem"
+        / "employees"
+    )

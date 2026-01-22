@@ -169,10 +169,12 @@ class RegistrationUI:
 
         det = self.face_detector.detect(raw)[0]
         aligned = align_face(raw, det.landmarks)
+        embedding = self.arcface.get_embedding(aligned)
 
         self.captured_faces.append({
             "angle": self.required_angles[self.current_angle_index],
-            "aligned_face": aligned
+            "aligned_face": aligned,
+            "embedding": embedding
         })
 
         self.current_angle_index += 1
@@ -190,6 +192,7 @@ class RegistrationUI:
         emp_name = self.emp_name_var.get()
 
         face_dir = get_employee_face_dir(emp_id, emp_name)
+        embeddings = {}
 
         meta = {
             "emp_id": emp_id,
@@ -200,9 +203,25 @@ class RegistrationUI:
 
         for item in self.captured_faces:
             name = item["angle"].lower()
+
             path = face_dir / f"{name}.png"
             cv2.imwrite(str(path), item["aligned_face"])
-            meta["samples"].append({"angle": name, "file": path.name})
+
+            embeddings[name] = item["embedding"].astype(np.float32)
+
+            meta["samples"].append({
+                "angle": name,
+                "file": path.name
+            })
+
+        if len(embeddings) != len(self.required_angles):
+            messagebox.showerror(
+                "Registration Error",
+                "Incomplete face capture. Please retry."
+            )
+            return
+
+        np.save(face_dir / "embeddings.npy", embeddings)
 
         with open(face_dir / "metadata.json", "w") as f:
             json.dump(meta, f, indent=4)

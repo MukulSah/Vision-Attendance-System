@@ -230,7 +230,12 @@ class MainMenuUI:
             #self.root.deiconify()
 
     def open_live_recognition(self):
-        messagebox.showinfo("Info", "Live Recognition module coming next")
+        try:
+            from src.ui.live_rtsp_ui import LiveRTSPUI
+            ui = LiveRTSPUI(parent=self.root)
+            ui.run()
+        except Exception as e:
+            messagebox.showerror("Live Recognition Error", str(e))
 
     def open_attendance_view(self):
         messagebox.showinfo("Info", "Attendance View module coming next")
