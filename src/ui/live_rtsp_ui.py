@@ -7,6 +7,9 @@ import numpy as np
 import time
 from queue import Queue
 import logging
+import csv
+from datetime import datetime
+from pathlib import Path
 
 from src.utils.storage import get_employees_root
 from src.detection.yolo_face_detector import YOLOv8FaceDetector
@@ -27,10 +30,12 @@ log = logging.getLogger("LIVE")
 BG_MAIN = "#0b0f1a"
 ACCENT = "#00e5ff"
 
-EMB_BUFFER_SIZE = 3          # was 5
-RECOGNITION_COOLDOWN = 1.2  # was 6.0 seconds
-SIM_THRESHOLD = 0.60        # was 0.65
+EMB_BUFFER_SIZE = 1
+RECOGNITION_COOLDOWN = 1.2
+SIM_THRESHOLD = 0.60
+FAST_LOCK_THRESHOLD = 0.72
 
+ATTENDANCE_COOLDOWN = 2  # seconds
 
 
 # ================== BYTETRACK CONFIG ==================
@@ -41,6 +46,47 @@ class ByteTrackArgs:
     aspect_ratio_thresh = 1.6
     min_box_area = 10
     mot20 = False
+
+
+# ================== ATTENDANCE HELPERS ==================
+def get_attendance_file() -> Path:
+    base = Path.home() / "Documents" / "YOAR_AttendaceSystem"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "attendance.csv"
+
+
+def write_attendance(emp_id: str, emp_name: str):
+    file = get_attendance_file()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    rows = []
+    found = False
+
+    if file.exists():
+        with open(file, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row["empId"] == emp_id:
+                    row["lastSeen"] = now
+                    found = True
+                rows.append(row)
+
+    if not found:
+        rows.append({
+            "empId": emp_id,
+            "empName": emp_name,
+            "lastSeen": now
+        })
+
+    with open(file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["empId", "empName", "lastSeen"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    log.info(f"📝 Attendance marked → {emp_id} @ {now}")
 
 
 # ================== LIVE RTSP UI ==================
@@ -75,7 +121,9 @@ class LiveRTSPUI:
         self.arcface = ArcFaceONNX("models/recognition/arcface_R100.onnx")
 
         self.known_embeddings = self.load_registered_faces()
+
         self.identity_cache = {}
+        self.attendance_cache = {}  # emp_key -> timestamp
 
         self.rtsp_var = tk.StringVar(
             value="rtsp://admin:password@192.168.1.35:554/cam/realmonitor?channel=1&subtype=1"
@@ -117,7 +165,6 @@ class LiveRTSPUI:
 
     # ================== CAPTURE LOOP ==================
     def capture_loop(self):
-        log.info("🎥 Capture thread started")
         while self.running:
             ret, frame = self.cap.read()
             if not ret:
@@ -131,7 +178,6 @@ class LiveRTSPUI:
 
     # ================== INFERENCE LOOP ==================
     def inference_loop(self):
-        log.info("🧠 Inference thread started")
         last_detections = []
 
         while self.running:
@@ -152,10 +198,12 @@ class LiveRTSPUI:
             sx, sy = w / 416, h / 416
 
             for det in last_detections:
-                x1, y1, x2, y2 = det.bbox
-                x1, y1, x2, y2 = int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy)
+                x1, y1, x2, y2 = map(int, (
+                    det.bbox[0]*sx, det.bbox[1]*sy,
+                    det.bbox[2]*sx, det.bbox[3]*sy
+                ))
 
-                if (x2-x1)*(y2-y1) < 3600:
+                if (x2 - x1) * (y2 - y1) < 3600:
                     continue
 
                 track_inputs.append([x1, y1, x2, y2, det.confidence])
@@ -202,14 +250,12 @@ class LiveRTSPUI:
 
         landmarks = None
         for bx1, by1, _, _, lm in landmark_inputs:
-            if abs(bx1-x1) < 40 and abs(by1-y1) < 40:
+            if abs(bx1 - x1) < 40 and abs(by1 - y1) < 40:
                 landmarks = lm
                 break
 
         if landmarks is not None and not cache["locked"]:
-
-            now = time.time()
-            if now - cache["last_attempt"] >= RECOGNITION_COOLDOWN:
+            if time.time() - cache["last_attempt"] >= RECOGNITION_COOLDOWN:
                 self.run_arcface(cache, frame, x1, y1, x2, y2, landmarks)
 
         label = "UNKNOWN"
@@ -218,23 +264,14 @@ class LiveRTSPUI:
             label = f"{cache['emp_id']} ({cache['sim']:.2f})"
             color = (0, 255, 0)
 
-        cv2.rectangle(frame, (x1,y1), (x2,y2), color, 2)
-        cv2.putText(frame, label, (x1, y1-10),
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(frame, label, (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
     # ================== ARCFACE ==================
     def run_arcface(self, cache, frame, x1, y1, x2, y2, landmarks):
-        """
-        Fast entry-recognition ArcFace pipeline
-        - Collects embeddings per track
-        - Early-lock at 2 embeddings (high confidence)
-        - Mean embedding at EMB_BUFFER_SIZE
-        - Locks once, no retries after lock
-        """
-
         cache["last_attempt"] = time.time()
 
-        # ---- crop face ----
         pad = 20
         fx1, fy1 = max(0, x1 - pad), max(0, y1 - pad)
         fx2, fy2 = min(frame.shape[1], x2 + pad), min(frame.shape[0], y2 + pad)
@@ -247,7 +284,6 @@ class LiveRTSPUI:
         lm[:, 0] -= fx1
         lm[:, 1] -= fy1
 
-        # ---- align ----
         try:
             aligned = align_face(roi, lm)
         except Exception:
@@ -256,7 +292,6 @@ class LiveRTSPUI:
         aligned = cv2.resize(aligned, (112, 112))
         aligned = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
 
-        # ---- ArcFace embedding ----
         emb = self.arcface.get_embedding(aligned)
         norm = np.linalg.norm(emb)
         if norm == 0:
@@ -266,53 +301,55 @@ class LiveRTSPUI:
         cache["embeddings"].append(emb)
 
         count = len(cache["embeddings"])
-        log.debug(f"🧪 Collecting embeddings {count}/{EMB_BUFFER_SIZE}")
 
-        # ================= EARLY FAST-PATH (2 embeddings) =================
         if count >= 2:
             mean_fast = np.mean(cache["embeddings"], axis=0)
             mean_fast /= np.linalg.norm(mean_fast)
+            best_id, best_sim = self.match_embedding(mean_fast)
 
-            best_id, best_sim = None, 0.0
-            for emp, lst in self.known_embeddings.items():
-                for ref in lst:
-                    sim = float(np.dot(mean_fast, ref))
-                    if sim > best_sim:
-                        best_sim, best_id = sim, emp
-
-            if best_sim >= 0.72:  # higher threshold for early lock
-                cache.update({
-                    "emp_id": best_id,
-                    "sim": best_sim,
-                    "locked": True
-                })
-                log.info(f"⚡ FAST LOCK → {best_id} ({best_sim:.2f})")
+            if best_sim >= FAST_LOCK_THRESHOLD:
+                self.lock_identity(cache, best_id, best_sim)
                 return
 
-        # ================= NORMAL PATH (3 embeddings) =================
         if count < EMB_BUFFER_SIZE:
             return
 
         mean_emb = np.mean(cache["embeddings"], axis=0)
         mean_emb /= np.linalg.norm(mean_emb)
+        best_id, best_sim = self.match_embedding(mean_emb)
 
+        if best_sim >= SIM_THRESHOLD:
+            self.lock_identity(cache, best_id, best_sim)
+        else:
+            cache["embeddings"].clear()
+
+    # ================== MATCH & LOCK ==================
+    def match_embedding(self, emb):
         best_id, best_sim = None, 0.0
         for emp, lst in self.known_embeddings.items():
             for ref in lst:
-                sim = float(np.dot(mean_emb, ref))
+                sim = float(np.dot(emb, ref))
                 if sim > best_sim:
                     best_sim, best_id = sim, emp
+        return best_id, best_sim
 
-        if best_sim >= SIM_THRESHOLD:
-            cache.update({
-                "emp_id": best_id,
-                "sim": best_sim,
-                "locked": True
-            })
-            log.info(f"🔒 Identity LOCKED → {best_id} ({best_sim:.2f})")
-        else:
-            cache["embeddings"].clear()
-            log.warning("🚫 Recognition failed (buffer reset)")
+    def lock_identity(self, cache, emp_key, sim):
+        emp_id, emp_name = emp_key.split("_", 1)
+
+        cache.update({
+            "emp_id": emp_key,
+            "sim": sim,
+            "locked": True
+        })
+
+        now = time.time()
+        last = self.attendance_cache.get(emp_key, 0)
+
+        if now - last >= ATTENDANCE_COOLDOWN:
+            write_attendance(emp_id, emp_name)
+            self.attendance_cache[emp_key] = now
+
+        log.info(f"🔒 LOCKED → {emp_key} ({sim:.2f})")
 
     # ================== UI UPDATE ==================
     def update_ui(self):
@@ -338,13 +375,11 @@ class LiveRTSPUI:
         db = {}
         base = get_employees_root()
 
-        log.info(f"📂 Loading embeddings from {base}")
         if not base.exists():
             return db
 
         for emp_dir in base.iterdir():
-            face_dir = emp_dir / "face_data"
-            emb_path = face_dir / "embeddings.npy"
+            emb_path = emp_dir / "face_data" / "embeddings.npy"
             if not emb_path.exists():
                 continue
 
